@@ -1,0 +1,107 @@
+From: ios-ginkgo <x@x>
+Subject: [PATCH] ginkgo: zap SCM logs, bounded resumes, no PIL shutdown by default
+ (gpu_zapshut=1), gpu_nozap=1; NT36672A frames with a bad checksum but sane
+ records are used, raw bytes logged
+
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index f05209c..f169cdd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1476,7 +1476,23 @@ touch_nt36672a(void)
+ 		return EAGAIN;          /* IC watchdog / ESD: caller releases fingers */
+ 	}
+ 	if ((uint8_t)(~sum + 1u) != pkt[NVT_POINT_LEN - 1u]) {
+-		return EBADMSG;
++		static unsigned dumped;
++		bool sane = false;
++		for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++			unsigned id = pkt[6u * i] >> 3, status = pkt[6u * i] & 7u;
++			if (id >= 1 && id <= TOUCH_MAX && (status == 1u || status == 2u)) {
++				sane = true;
++			}
++		}
++		if (dumped < 6) {
++			dumped++;
++			printf("SWEET TOUCH: nvt csum %02x want %02x sane=%d raw %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    (uint8_t)(~sum + 1u), pkt[NVT_POINT_LEN - 1u], sane, pkt[0], pkt[1], pkt[2], pkt[3], pkt[4],
++			    pkt[5], pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11]);
++		}
++		if (!sane) {
++			return EBADMSG;
++		}
+ 	}
+ 	st.s_frames++;
+ 	if ((pkt[0] >> 3) == NVT_PROTO_PALM && pkt[1] == 4u) {
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+index 6ee951f..be3c0b1 100644
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -558,13 +558,21 @@ static uint64_t
+ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
+ {
+ 	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++	int n = 0;
+ 	smc(args);
+-	for (int n = 0; args[0] == 1 && n < 100000; n++) {     /* interrupted: resume with the session in x6 */
++	/* ginkgo: interrupted (x0 = 1): resume with the session in x6, a bounded number of times, logged */
++	for (; args[0] == 1 && n < 2000; n++) {
+ 		uint64_t session = args[6];
+ 		uint64_t again[8] = { 1, arginfo, a, b, c, 0, session, 0 };
+ 		memcpy(args, again, sizeof(args));
++		if ((n & 255) == 255) {
++			IOSleep(1);
++		}
+ 		smc(args);
+ 	}
++	if (n != 0) {
++		IOLog("TopazGPU: scm %#x: %d resumes, x0=%llx\n", fn, n, args[0]);
++	}
+ 	if (res1 != NULL) {
+ 		*res1 = args[1];
+ 	}
+@@ -574,6 +582,11 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ static bool
+ zap_load(void)
+ {
++	uint32_t nozap = 0;
++	if (PE_parse_boot_argn("gpu_nozap", &nozap, sizeof(nozap)) && nozap) {
++		IOLog("TopazGPU: zap: skipped (gpu_nozap=1)\n");
++		return true;
++	}
+ 	void *mdt = NULL, *seg = NULL;
+ 	size_t mdt_size = 0, seg_size = 0;
+ 	struct kbuf meta = {};
+@@ -624,8 +637,23 @@ zap_load(void)
+ 		memcpy(meta.va, mdt, mdt_size);
+ 		sweet_dcache_clean((vm_offset_t)meta.va, (unsigned)mdt_size);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+-		scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++		{
++			/* ginkgo: is PIL init_image there at all (SCM INFO is_call_available, svc 6 cmd 1)? */
++			uint64_t avail = 0, ast = scm(SCM_FN(6, 1), 1, SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 0, 0, &avail);
++			IOLog("TopazGPU: zap: scm info init_image available st=%llx res=%llx\n", ast, avail);
++		}
++		{
++			uint32_t zapshut = 0;
++			(void)PE_parse_boot_argn("gpu_zapshut", &zapshut, sizeof(zapshut));
++			if (zapshut) {
++				IOLog("TopazGPU: zap: shutdown first (gpu_zapshut=1)\n");
++				uint64_t sst = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++				IOLog("TopazGPU: zap: shutdown %llx/%llx\n", sst, res);
++			}
++		}
++		IOLog("TopazGPU: zap: init_image (meta %#llx, %zu bytes)\n", meta.pa, mdt_size);
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta.pa, 0, &res);
++		IOLog("TopazGPU: zap: init_image returned %llx/%llx\n", st, res);
+ 		if (st != 0 || res != 0) {
+ 			IOLog("TopazGPU: zap init_image: %llx/%llx\n", st, res);
+ 			goto out;
+@@ -648,6 +676,7 @@ zap_load(void)
+ 			dst[at + i] = ((const uint8_t *)seg)[i];
+ 		}
+ 		__asm__ volatile ("dsb sy" ::: "memory");
++		IOLog("TopazGPU: zap: auth_and_reset\n");
+ 		st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
+ 		IOLog("TopazGPU: zap auth_and_reset: %llx/%llx\n", st, res);
+ 		ok = st == 0 && res == 0;
