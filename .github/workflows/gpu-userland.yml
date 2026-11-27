@@ -4,6 +4,11 @@ name: gpu-userland
 # Only open-source code is built and uploaded; no Apple binaries are in the artifact.
 on:
   workflow_dispatch:
+  push:
+    branches: [ginkgo]
+    paths:
+      - "userland/**"
+      - ".github/workflows/gpu-userland.yml"
 
 jobs:
   build:
